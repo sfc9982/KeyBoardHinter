@@ -32,3 +32,10 @@ if(WIN32)
         COMMAND ${CMAKE_COMMAND} -E copy_if_different ${WX_DLLS} $<TARGET_FILE_DIR:KeyBoardHinter>
         COMMENT "复制 wxWidgets DLL 到输出目录")
 endif()
+
+# 单元测试：锁定键状态机（LockState）不依赖 wxWidgets 与 Win32 UI，零第三方依赖。
+# 构建后运行：ctest --test-dir build -C Debug
+enable_testing()
+add_executable(LockStateTest LockStateTest.cpp)
+target_compile_definitions(LockStateTest PRIVATE _CRT_SECURE_NO_WARNINGS)
+add_test(NAME LockStateTest COMMAND LockStateTest)

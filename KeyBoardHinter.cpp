@@ -1,9 +1,15 @@
 #include <wx/wx.h>
+#include <wx/app.h>
 #include <wx/dcbuffer.h>
+#include <wx/dcmemory.h>
 #include <wx/graphics.h>
+#include <wx/taskbar.h>
 #include <memory>
+#include <string>
 
 #include <Windows.h>
+
+#include "LockState.h"
 
 namespace {
 
@@ -14,188 +20,342 @@ constexpr int   kWindowHeight   = 112;
 constexpr int   kVerticalPosNum = 7; // 悬浮窗垂直定位在屏幕 7/8 高度处
 constexpr int   kVerticalPosDen = 8;
 
+// 托盘右键菜单项 ID
+enum {
+	kAutoStartMenuId = wxID_HIGHEST + 1,
+	kShowStateMenuId,
+	kQuitMenuId,
+};
+
+// 开机自启注册表项：HKCU\...\Run 下的一个 REG_SZ，值为带引号的 EXE 路径
+constexpr wchar_t kAutoStartRunKey[]   = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t kAutoStartValueName[] = L"KeyBoardHinter";
+
+std::wstring GetModulePath() {
+	wchar_t buffer[MAX_PATH];
+	const DWORD length = ::GetModuleFileNameW(nullptr, buffer, MAX_PATH);
+	if (length == 0 || length >= MAX_PATH) {
+		return {};
+	}
+	return std::wstring(buffer, length);
+}
+
+bool IsAutoStartEnabled() {
+	HKEY key = nullptr;
+	if (::RegOpenKeyExW(HKEY_CURRENT_USER, kAutoStartRunKey, 0, KEY_READ, &key) != ERROR_SUCCESS) {
+		return false;
+	}
+	wchar_t value[MAX_PATH];
+	DWORD   size = sizeof(value);
+	const LSTATUS rc = ::RegQueryValueExW(key, kAutoStartValueName, nullptr, nullptr,
+		reinterpret_cast<LPBYTE>(value), &size);
+	::RegCloseKey(key);
+	return rc == ERROR_SUCCESS;
+}
+
+bool SetAutoStartEnabled(bool enable) {
+	const std::wstring exe = GetModulePath();
+	if (exe.empty()) {
+		return false;
+	}
+	HKEY key = nullptr;
+	if (::RegCreateKeyExW(HKEY_CURRENT_USER, kAutoStartRunKey, 0, nullptr, 0,
+			KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) {
+		return false;
+	}
+	const LSTATUS rc = [&]() -> LSTATUS {
+		if (!enable) {
+			return ::RegDeleteValueW(key, kAutoStartValueName);
+		}
+		const std::wstring command = L"\"" + exe + L"\"";
+		return ::RegSetValueExW(key, kAutoStartValueName, 0, REG_SZ,
+			reinterpret_cast<const BYTE *>(command.c_str()),
+			static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+	}();
+	::RegCloseKey(key);
+	return rc == ERROR_SUCCESS;
+}
+
+// 程序化绘制 16x16 托盘图标：蓝色圆角底 + 白色大写 A，避免引入 .ico 资源文件
+wxBitmap MakeTrayBitmap() {
+	constexpr int size = 16;
+	wxBitmap bmp(size, size, 32);
+	{
+		wxMemoryDC dc(bmp);
+		dc.SetBackground(wxBrush(wxColour(0x2B, 0x6C, 0xB2)));
+		dc.Clear();
+		dc.SetPen(*wxTRANSPARENT_PEN);
+		dc.SetBrush(wxBrush(wxColour(0x2B, 0x6C, 0xB2)));
+		dc.DrawRoundedRectangle(0, 0, size, size, 3);
+		dc.SetTextForeground(*wxWHITE);
+		dc.SetFont(wxFont(wxSize(0, 11), wxFONTFAMILY_DEFAULT, wxFONTSTYLE_NORMAL, wxFONTWEIGHT_BOLD));
+		const wxSize textSize = dc.GetTextExtent("A");
+		dc.DrawText("A", (size - textSize.x) / 2, (size - textSize.y) / 2);
+	}
+	return bmp;
+}
+
 } // namespace
+
+class MyFrame;
+
+// 托盘图标：右键菜单提供开机自启勾选、显示当前状态、退出；左键单击显示当前状态
+class TrayIcon : public wxTaskBarIcon {
+public:
+	explicit TrayIcon(MyFrame *frame);
+	wxMenu *CreatePopupMenu() override;
+
+private:
+	void OnLeftDown(wxTaskBarIconEvent &);
+	void OnToggleAutoStart(wxCommandEvent &);
+	void OnShowState(wxCommandEvent &);
+	void OnQuit(wxCommandEvent &);
+
+	MyFrame *m_frame;
+};
 
 class MyFrame : public wxFrame {
 public:
-	MyFrame()
-		: wxFrame(nullptr,
-			wxID_ANY,
-			"",
-			wxDefaultPosition,
-			wxSize(kWindowWidth, kWindowHeight),
-			wxPOPUP_WINDOW | wxNO_BORDER | wxFRAME_NO_TASKBAR | wxFRAME_TOOL_WINDOW | wxSTAY_ON_TOP) {
-		Hide();
+	MyFrame();
+	~MyFrame() override;
 
-		SetBackgroundColour(wxColour(244, 244, 244));
-		SetBackgroundStyle(wxBG_STYLE_PAINT);
-		SetClientSize(FromDIP(wxSize(kWindowWidth, kWindowHeight)));
-		Bind(wxEVT_PAINT, &MyFrame::PaintCard, this);
-		PlaceOnScreen();
+	// 供 TrayIcon 调用的公共入口
+	void ShowCurrentState();
+	void QuitApp();
 
-		// 快照启动时刻的真实锁定状态，避免把历史状态误当成"刚刚发生的变化"
-		m_capslockOn = (::GetKeyState(VK_CAPITAL) & 1) != 0;
-		m_numlockOn  = (::GetKeyState(VK_NUMLOCK) & 1) != 0;
-
-		// 低级键盘钩子改为事件驱动：只在 Caps/Num 键真实按下时才被唤醒，
-		// 替代原先 150ms 一次的轮询定时器——空闲时零开销、响应无延迟；
-		// 顺带修复了轮询定时器每 150ms 重置隐藏倒计时、导致悬浮窗永不消失的问题。
-		// 局限：钩子收不到发送给更高权限（管理员）窗口的按键，日常使用不受影响。
-		s_instance = this;
-		m_keyboardHook = ::SetWindowsHookExW(WH_KEYBOARD_LL,
-			&MyFrame::LowLevelKeyboardProc,
-			::GetModuleHandleW(nullptr),
-			0);
-
-		m_nap.Bind(wxEVT_TIMER, &MyFrame::TakeNap, this);
-	}
-
-	~MyFrame() override {
-		if (m_keyboardHook != nullptr) {
-			::UnhookWindowsHookEx(m_keyboardHook);
-		}
-		s_instance = nullptr;
-	}
-
-	static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
-		if (nCode == HC_ACTION && wParam == WM_KEYUP) {
-			const auto &info = *reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
-			if (info.vkCode == VK_CAPITAL || info.vkCode == VK_NUMLOCK) {
-				// 钩子回调运行在安装线程（主线程）的 GetMessage 内，可直接操作 UI；
-				// 只在 WM_KEYUP 处理，保证切换状态已生效，并天然过滤按键自动重复
-				if (s_instance != nullptr) {
-					s_instance->OnLockKeyToggled(info.vkCode);
-				}
-			}
-		}
-		return ::CallNextHookEx(nullptr, nCode, wParam, lParam);
-	}
-
-	void OnLockKeyToggled(DWORD vkCode) {
-		const bool isOn = (::GetKeyState(static_cast<int>(vkCode)) & 1) != 0;
-
-		bool changed = false;
-		if (vkCode == VK_NUMLOCK && isOn != m_numlockOn) {
-			// 与 Num Lock 相关的提示优先显示（保留旧行为）
-			m_numlockOn = isOn;
-			m_hintText = isOn ? "Num Lock On" : "Num Lock Off";
-			changed = true;
-		} else if (vkCode == VK_CAPITAL && isOn != m_capslockOn) {
-			m_capslockOn = isOn;
-			m_hintText = isOn ? "Caps Lock On" : "Caps Lock Off";
-			changed = true;
-		}
-
-		if (changed) {
-			m_displayKey = vkCode;
-			m_displayOn = isOn;
-			Refresh(false);
-			ShowNoActivate();
-			// 只在状态真正变化时重启隐藏倒计时，1 秒后自动隐藏
-			m_nap.Start(kHideDelayMs, wxTIMER_ONE_SHOT);
-		}
-	}
-
-	void TakeNap(wxTimerEvent &event) {
-#ifdef __WXMSW__
-		::ShowWindow(GetHWND(), SW_HIDE);
-#else
-		Hide();
-#endif
-	}
+	static LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam);
+	void OnLockKeyToggled(DWORD vkCode);
 
 private:
-	void PaintCard(wxPaintEvent &) {
-		wxAutoBufferedPaintDC dc(this);
-		dc.SetBackground(wxBrush(GetBackgroundColour()));
-		dc.Clear();
-		std::unique_ptr<wxGraphicsContext> gc(wxGraphicsContext::Create(dc));
-		if (!gc) return;
-		// 在逻辑尺寸上绘制，文字和图标随 Windows DPI 一起缩放。
-		gc->Scale(static_cast<double>(GetClientSize().x) / kWindowWidth,
-			static_cast<double>(GetClientSize().y) / kWindowHeight);
-		const wxColour ink(20, 20, 20);
-		gc->SetPen(wxPen(wxColour(224, 224, 224), 1));
-		gc->SetBrush(*wxTRANSPARENT_BRUSH);
-		gc->DrawRectangle(0.5, 0.5, kWindowWidth - 1, kWindowHeight - 1);
+	void PaintCard(wxPaintEvent &);
+	void TakeNap(wxTimerEvent &);
+	void ShowNoActivate();
+	void PlaceOnScreen();
 
-		if (m_displayKey == VK_CAPITAL) {
-			// 双 A 使用矢量笔画，避免字体替换改变图标形状。
-			gc->SetPen(wxPen(ink, 2.3));
-			auto drawA = [&](double x, double y, double width, double height) {
-				auto path = gc->CreatePath();
-				path.MoveToPoint(x, y + height);
-				path.AddLineToPoint(x + width / 2, y);
-				path.AddLineToPoint(x + width, y + height);
-				path.MoveToPoint(x + width * 0.23, y + height * 0.62);
-				path.AddLineToPoint(x + width * 0.77, y + height * 0.62);
-				gc->StrokePath(path);
-			};
-			drawA(61, 25, 18, 22);
-			drawA(81, 29, 16, 18);
-		} else {
-			// 数字锁：开启时锁梁闭合，关闭时右侧抬起。
-			gc->SetPen(wxPen(ink, 2.3));
-			auto shackle = gc->CreatePath();
-			shackle.MoveToPoint(69, 33);
-			shackle.AddLineToPoint(69, 29);
-			if (m_displayOn) {
-				shackle.AddCurveToPoint(69, 15, 91, 15, 91, 29);
-				shackle.AddLineToPoint(91, 33);
-			} else {
-				shackle.AddCurveToPoint(69, 15, 84, 13, 90, 21);
-			}
-			gc->StrokePath(shackle);
-			gc->DrawRectangle(66, 33, 28, 23);
-			// 矢量数字 1，保持不同 DPI 下的笔画比例一致。
-			gc->SetPen(wxPen(ink, 1.8));
-			auto numeral = gc->CreatePath();
-			numeral.MoveToPoint(77, 42);
-			numeral.AddLineToPoint(80, 39);
-			numeral.AddLineToPoint(80, 50);
-			gc->StrokePath(numeral);
-		}
-		if (m_displayKey == VK_CAPITAL && !m_displayOn) {
-			// 浅色描边让关闭斜线穿过图标时仍然清晰。
-			gc->SetPen(wxPen(GetBackgroundColour(), 6));
-			gc->StrokeLine(61, 51, 99, 20);
-			gc->SetPen(wxPen(ink, 2));
-			gc->StrokeLine(61, 51, 99, 20);
-		}
-		gc->SetFont(wxFont(wxFontInfo(wxSize(0, 14)).FaceName("Segoe UI")), wxColour(35, 35, 35));
-		double width, height;
-		gc->GetTextExtent(m_hintText, &width, &height);
-		gc->DrawText(m_hintText, (kWindowWidth - width) / 2, 70 - height / 2);
-	}
-
-	// 用 SHOWNOACTIVATE 显示 OSD，避免抢走当前活动窗口的键盘焦点
-	void ShowNoActivate() {
-#ifdef __WXMSW__
-		::ShowWindow(GetHWND(), SW_SHOWNOACTIVATE);
-#else
-		Show();
-#endif
-	}
-
-	// 纯整数运算定位到屏幕 7/8 高度处（(h*7+4)/8 等价于四舍五入），
-	// 避免 floor() 带来的隐式 <math.h> 依赖
-	void PlaceOnScreen() {
-		const wxSize screenSize = wxGetDisplaySize();
-		const int    bottomY    = (screenSize.GetHeight() * kVerticalPosNum + kVerticalPosDen / 2) / kVerticalPosDen;
-		CenterOnScreen(wxHORIZONTAL);
-		Move(wxPoint(GetPosition().x, bottomY - GetSize().GetHeight() / 2));
-	}
-
-	wxString      m_hintText     = "Caps Lock Off";
-	DWORD         m_displayKey   = VK_CAPITAL;
-	bool          m_displayOn    = false;
-	wxTimer       m_nap;
-	bool          m_capslockOn   = false;
-	bool          m_numlockOn    = false;
-	HHOOK         m_keyboardHook = nullptr;
+	wxString  m_hintText     = "Caps Lock Off";
+	DWORD     m_displayKey   = VK_CAPITAL;
+	bool      m_displayOn    = false;
+	bool      m_overview     = false; // 显示当前锁定状态总览（托盘入口），不画图标
+	wxTimer   m_nap;
+	LockState m_state;
+	HHOOK     m_keyboardHook = nullptr;
+	std::unique_ptr<TrayIcon> m_trayIcon;
 
 	static MyFrame *s_instance;
 };
+
+TrayIcon::TrayIcon(MyFrame *frame)
+	: m_frame(frame) {
+	SetIcon(wxBitmapBundle::FromBitmap(MakeTrayBitmap()), "KeyBoardHinter");
+	Bind(wxEVT_TASKBAR_LEFT_DOWN, &TrayIcon::OnLeftDown, this);
+}
+
+wxMenu *TrayIcon::CreatePopupMenu() {
+	wxMenu *menu = new wxMenu();
+	wxMenuItem *autoStartItem = menu->AppendCheckItem(kAutoStartMenuId, "开机自启");
+	autoStartItem->Check(IsAutoStartEnabled());
+	menu->Append(kShowStateMenuId, "显示当前状态");
+	menu->AppendSeparator();
+	menu->Append(kQuitMenuId, "退出");
+	menu->Bind(wxEVT_MENU, &TrayIcon::OnToggleAutoStart, this, kAutoStartMenuId);
+	menu->Bind(wxEVT_MENU, &TrayIcon::OnShowState, this, kShowStateMenuId);
+	menu->Bind(wxEVT_MENU, &TrayIcon::OnQuit, this, kQuitMenuId);
+	return menu;
+}
+
+void TrayIcon::OnLeftDown(wxTaskBarIconEvent &) { m_frame->ShowCurrentState(); }
+void TrayIcon::OnToggleAutoStart(wxCommandEvent &event) { SetAutoStartEnabled(event.IsChecked()); }
+void TrayIcon::OnShowState(wxCommandEvent &) { m_frame->ShowCurrentState(); }
+void TrayIcon::OnQuit(wxCommandEvent &) { m_frame->QuitApp(); }
+
+MyFrame::MyFrame()
+	: wxFrame(nullptr,
+		wxID_ANY,
+		"",
+		wxDefaultPosition,
+		wxSize(kWindowWidth, kWindowHeight),
+		wxPOPUP_WINDOW | wxNO_BORDER | wxFRAME_NO_TASKBAR | wxFRAME_TOOL_WINDOW | wxSTAY_ON_TOP) {
+	Hide();
+
+	SetBackgroundColour(wxColour(244, 244, 244));
+	SetBackgroundStyle(wxBG_STYLE_PAINT);
+	SetClientSize(FromDIP(wxSize(kWindowWidth, kWindowHeight)));
+	Bind(wxEVT_PAINT, &MyFrame::PaintCard, this);
+	PlaceOnScreen();
+
+	// 快照启动时刻的真实锁定状态，避免把历史状态误当成"刚刚发生的变化"
+	m_state = LockState((::GetKeyState(VK_CAPITAL) & 1) != 0, (::GetKeyState(VK_NUMLOCK) & 1) != 0);
+
+	// 低级键盘钩子改为事件驱动：只在 Caps/Num 键真实按下时才被唤醒，
+	// 替代原先 150ms 一次的轮询定时器——空闲时零开销、响应无延迟；
+	// 顺带修复了轮询定时器每 150ms 重置隐藏倒计时、导致悬浮窗永不消失的问题。
+	// 局限：钩子收不到发送给更高权限（管理员）窗口的按键，日常使用不受影响。
+	s_instance = this;
+	m_keyboardHook = ::SetWindowsHookExW(WH_KEYBOARD_LL,
+		&MyFrame::LowLevelKeyboardProc,
+		::GetModuleHandleW(nullptr),
+		0);
+
+	m_trayIcon = std::make_unique<TrayIcon>(this);
+
+	m_nap.Bind(wxEVT_TIMER, &MyFrame::TakeNap, this);
+}
+
+MyFrame::~MyFrame() {
+	if (m_keyboardHook != nullptr) {
+		::UnhookWindowsHookEx(m_keyboardHook);
+	}
+	s_instance = nullptr;
+}
+
+LRESULT CALLBACK MyFrame::LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+	if (nCode == HC_ACTION && wParam == WM_KEYUP) {
+		const auto &info = *reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
+		if (info.vkCode == VK_CAPITAL || info.vkCode == VK_NUMLOCK) {
+			// 钩子回调运行在安装线程（主线程）的 GetMessage 内，可直接操作 UI；
+			// 只在 WM_KEYUP 处理，保证切换状态已生效，并天然过滤按键自动重复
+			if (s_instance != nullptr) {
+				s_instance->OnLockKeyToggled(info.vkCode);
+			}
+		}
+	}
+	return ::CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+void MyFrame::OnLockKeyToggled(DWORD vkCode) {
+	const bool isOn = (::GetKeyState(static_cast<int>(vkCode)) & 1) != 0;
+	// 状态是否变化、提示文本与显示内容由 LockState 独立判定（该逻辑可脱离 UI 测试）
+	const LockState::Result result = m_state.Update(vkCode, isOn);
+
+	if (result.changed) {
+		m_overview = false;
+		m_hintText = wxString(result.hintText);
+		m_displayKey = result.displayKey;
+		m_displayOn = result.displayOn;
+		Refresh(false);
+		ShowNoActivate();
+		// 只在状态真正变化时重启隐藏倒计时，1 秒后自动隐藏
+		m_nap.Start(kHideDelayMs, wxTIMER_ONE_SHOT);
+	}
+}
+
+// 显示当前 Caps/Num 锁定状态总览（不改动状态，仅作展示）
+void MyFrame::ShowCurrentState() {
+	m_overview = true;
+	Refresh(false);
+	ShowNoActivate();
+	m_nap.Start(kHideDelayMs, wxTIMER_ONE_SHOT);
+}
+
+void MyFrame::QuitApp() {
+	// 退出主循环；托盘图标与键盘钩子随 wxApp 清理及进程退出释放
+	wxTheApp->ExitMainLoop();
+}
+
+void MyFrame::TakeNap(wxTimerEvent &event) {
+#ifdef __WXMSW__
+	::ShowWindow(GetHWND(), SW_HIDE);
+#else
+	Hide();
+#endif
+}
+
+void MyFrame::PaintCard(wxPaintEvent &) {
+	wxAutoBufferedPaintDC dc(this);
+	dc.SetBackground(wxBrush(GetBackgroundColour()));
+	dc.Clear();
+	std::unique_ptr<wxGraphicsContext> gc(wxGraphicsContext::Create(dc));
+	if (!gc) return;
+	// 在逻辑尺寸上绘制，文字和图标随 Windows DPI 一起缩放。
+	gc->Scale(static_cast<double>(GetClientSize().x) / kWindowWidth,
+		static_cast<double>(GetClientSize().y) / kWindowHeight);
+
+	if (m_overview) {
+		// 状态总览：只显示两行文字，不画图标与边框
+		gc->SetFont(wxFont(wxFontInfo(wxSize(0, 12)).FaceName("Segoe UI")), wxColour(35, 35, 35));
+		const wxString capsText = m_state.IsCapsLockOn() ? wxString("On") : wxString("Off");
+		const wxString numText  = m_state.IsNumLockOn() ? wxString("On") : wxString("Off");
+		auto drawLine = [&](int y, const wxString &text) {
+			double width, height;
+			gc->GetTextExtent(text, &width, &height);
+			gc->DrawText(text, (kWindowWidth - width) / 2, y - height / 2);
+		};
+		drawLine(46, wxString::Format("Caps Lock: %s", capsText));
+		drawLine(66, wxString::Format("Num Lock: %s", numText));
+		return;
+	}
+
+	const wxColour ink(20, 20, 20);
+	gc->SetPen(wxPen(wxColour(224, 224, 224), 1));
+	gc->SetBrush(*wxTRANSPARENT_BRUSH);
+	gc->DrawRectangle(0.5, 0.5, kWindowWidth - 1, kWindowHeight - 1);
+
+	if (m_displayKey == VK_CAPITAL) {
+		// 双 A 使用矢量笔画，避免字体替换改变图标形状。
+		gc->SetPen(wxPen(ink, 2.3));
+		auto drawA = [&](double x, double y, double width, double height) {
+			auto path = gc->CreatePath();
+			path.MoveToPoint(x, y + height);
+			path.AddLineToPoint(x + width / 2, y);
+			path.AddLineToPoint(x + width, y + height);
+			path.MoveToPoint(x + width * 0.23, y + height * 0.62);
+			path.AddLineToPoint(x + width * 0.77, y + height * 0.62);
+			gc->StrokePath(path);
+		};
+		drawA(61, 25, 18, 22);
+		drawA(81, 29, 16, 18);
+	} else {
+		// 数字锁：开启时锁梁闭合，关闭时右侧抬起。
+		gc->SetPen(wxPen(ink, 2.3));
+		auto shackle = gc->CreatePath();
+		shackle.MoveToPoint(69, 33);
+		shackle.AddLineToPoint(69, 29);
+		if (m_displayOn) {
+			shackle.AddCurveToPoint(69, 15, 91, 15, 91, 29);
+			shackle.AddLineToPoint(91, 33);
+		} else {
+			shackle.AddCurveToPoint(69, 15, 84, 13, 90, 21);
+		}
+		gc->StrokePath(shackle);
+		gc->DrawRectangle(66, 33, 28, 23);
+		// 矢量数字 1，保持不同 DPI 下的笔画比例一致。
+		gc->SetPen(wxPen(ink, 1.8));
+		auto numeral = gc->CreatePath();
+		numeral.MoveToPoint(77, 42);
+		numeral.AddLineToPoint(80, 39);
+		numeral.AddLineToPoint(80, 50);
+		gc->StrokePath(numeral);
+	}
+	if (m_displayKey == VK_CAPITAL && !m_displayOn) {
+		// 浅色描边让关闭斜线穿过图标时仍然清晰。
+		gc->SetPen(wxPen(GetBackgroundColour(), 6));
+		gc->StrokeLine(61, 51, 99, 20);
+		gc->SetPen(wxPen(ink, 2));
+		gc->StrokeLine(61, 51, 99, 20);
+	}
+	gc->SetFont(wxFont(wxFontInfo(wxSize(0, 14)).FaceName("Segoe UI")), wxColour(35, 35, 35));
+	double width, height;
+	gc->GetTextExtent(m_hintText, &width, &height);
+	gc->DrawText(m_hintText, (kWindowWidth - width) / 2, 70 - height / 2);
+}
+
+// 用 SHOWNOACTIVATE 显示 OSD，避免抢走当前活动窗口的键盘焦点
+void MyFrame::ShowNoActivate() {
+#ifdef __WXMSW__
+	::ShowWindow(GetHWND(), SW_SHOWNOACTIVATE);
+#else
+	Show();
+#endif
+}
+
+// 纯整数运算定位到屏幕 7/8 高度处（(h*7+4)/8 等价于四舍五入），
+// 避免 floor() 带来的隐式 <math.h> 依赖
+void MyFrame::PlaceOnScreen() {
+	const wxSize screenSize = wxGetDisplaySize();
+	const int    bottomY    = (screenSize.GetHeight() * kVerticalPosNum + kVerticalPosDen / 2) / kVerticalPosDen;
+	CenterOnScreen(wxHORIZONTAL);
+	Move(wxPoint(GetPosition().x, bottomY - GetSize().GetHeight() / 2));
+}
 
 MyFrame *MyFrame::s_instance = nullptr;
 

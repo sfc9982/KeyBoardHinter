@@ -2,7 +2,7 @@ project_configs = {
 	[".targets"] = {
 	};
 	[".build"] = {
-		config = [[Debug]];
+		config = [[Release]];
 		target = [[KeyBoardHinter]];
 		toolset = [[vs2019-x64|14.29.30133|10.0.26100.0]];
 	};
@@ -11,13 +11,13 @@ project_configs = {
 			[[KeyBoardHinter.cpp]];
 		};
 		states = {
-			["KeyBoardHinter.cpp"] = {
-				cursor = {156;0};
-				fold = [[KLUv/SABCQAAAQ==]];
-			};
 			["CMakeLists.txt"] = {
-				cursor = {0;0};
 				fold = [[KLUv/SABCQAAAQ==]];
+				cursor = {0;0};
+			};
+			["KeyBoardHinter.cpp"] = {
+				fold = [[KLUv/SABCQAAAQ==]];
+				cursor = {115;27};
 			};
 		};
 	};
