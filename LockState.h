@@ -18,8 +18,8 @@ public:
 	};
 
 	LockState() = default;
-	LockState(bool capslockOn, bool numlockOn)
-		: m_capslockOn(capslockOn), m_numlockOn(numlockOn) {}
+	LockState(bool capslockOn, bool numlockOn, bool scrolllockOn = false)
+		: m_capslockOn(capslockOn), m_numlockOn(numlockOn), m_scrolllockOn(scrolllockOn) {}
 
 	// 上报某锁定键释放后的状态，isOn 为该键的真实开关状态（由调用方读取 GetKeyState）。
 	// 状态无变化（例如按键自动重复）时返回 changed=false，调用方不应刷新或显示 OSD。
@@ -34,6 +34,10 @@ public:
 			m_capslockOn = isOn;
 			result.hintText = isOn ? "Caps Lock On" : "Caps Lock Off";
 			result.changed  = true;
+		} else if (vkCode == VK_SCROLL && isOn != m_scrolllockOn) {
+			m_scrolllockOn = isOn;
+			result.hintText = isOn ? "Scroll Lock On" : "Scroll Lock Off";
+			result.changed  = true;
 		}
 		if (result.changed) {
 			result.displayKey = vkCode;
@@ -44,8 +48,10 @@ public:
 
 	bool IsCapsLockOn() const { return m_capslockOn; }
 	bool IsNumLockOn() const { return m_numlockOn; }
+	bool IsScrollLockOn() const { return m_scrolllockOn; }
 
 private:
-	bool m_capslockOn = false;
-	bool m_numlockOn  = false;
+	bool m_capslockOn   = false;
+	bool m_numlockOn    = false;
+	bool m_scrolllockOn = false;
 };

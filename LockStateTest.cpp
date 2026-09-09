@@ -29,6 +29,7 @@ void TestInitialDefaults() {
 	LockState state;
 	CHECK(!state.IsCapsLockOn());
 	CHECK(!state.IsNumLockOn());
+	CHECK(!state.IsScrollLockOn());
 }
 
 void TestCapsLockToggle() {
@@ -73,6 +74,26 @@ void TestNumLockToggle() {
 	CHECK(!state.IsNumLockOn());
 }
 
+void TestScrollLockToggle() {
+	LockState state;
+
+	const LockState::Result on = state.Update(VK_SCROLL, true);
+	CHECK(on.changed);
+	CHECK(on.displayKey == VK_SCROLL);
+	CHECK(on.displayOn);
+	CHECK(on.hintText == "Scroll Lock On");
+	CHECK(state.IsScrollLockOn());
+	CHECK(!state.IsCapsLockOn());
+	CHECK(!state.IsNumLockOn());
+
+	const LockState::Result off = state.Update(VK_SCROLL, false);
+	CHECK(off.changed);
+	CHECK(off.displayKey == VK_SCROLL);
+	CHECK(!off.displayOn);
+	CHECK(off.hintText == "Scroll Lock Off");
+	CHECK(!state.IsScrollLockOn());
+}
+
 void TestNumLockPriority() {
 	// 两键状态独立跟踪，且 Num Lock 事件优先于 Caps Lock 显示（保留旧行为）
 	LockState state;
@@ -91,9 +112,10 @@ void TestNumLockPriority() {
 
 void TestInitialSnapshot() {
 	// 启动快照真实状态：Caps 已开启时收到"开启"事件不应提示，收到"关闭"才提示
-	LockState state(true, false);
+	LockState state(true, false, true);
 	CHECK(state.IsCapsLockOn());
 	CHECK(!state.IsNumLockOn());
+	CHECK(state.IsScrollLockOn());
 
 	const LockState::Result noop = state.Update(VK_CAPITAL, true);
 	CHECK(!noop.changed);
@@ -110,6 +132,7 @@ int main() {
 	TestInitialDefaults();
 	TestCapsLockToggle();
 	TestNumLockToggle();
+	TestScrollLockToggle();
 	TestNumLockPriority();
 	TestInitialSnapshot();
 
