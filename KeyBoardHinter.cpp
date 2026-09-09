@@ -9,16 +9,17 @@
 
 #include <Windows.h>
 
+#include "Config.h"
 #include "LockState.h"
 
 namespace
 {
 
-	constexpr int kHideDelayMs = 1000;
-	constexpr int kWindowWidth = 160;
-	constexpr int kWindowHeight = 112;
-	constexpr int kVerticalPosNum = 7;
-	constexpr int kVerticalPosDen = 8;
+	constexpr int kHideDelayMs = 1000;     // 默认隐藏延迟，可被配置文件覆盖
+	constexpr int kWindowWidth = 160;      // 绘制基准宽度，物理窗口大小从配置读取
+	constexpr int kWindowHeight = 112;     // 绘制基准高度
+	constexpr int kVerticalPosNum = 7;     // 默认垂直位置分子（位置 = 高度 * num / den）
+	constexpr int kVerticalPosDen = 8;     // 默认垂直位置分母
 
 	enum
 	{
@@ -149,6 +150,7 @@ private:
 	LockState m_state;
 	HHOOK m_keyboardHook = nullptr;
 	std::unique_ptr<TrayIcon> m_trayIcon;
+	Config m_config;
 
 	static MyFrame *s_instance;
 };
@@ -187,16 +189,25 @@ MyFrame::MyFrame()
 			  wxSize(kWindowWidth, kWindowHeight),
 			  wxPOPUP_WINDOW | wxNO_BORDER | wxFRAME_NO_TASKBAR | wxFRAME_TOOL_WINDOW | wxSTAY_ON_TOP)
 {
+	m_config.Load();
+	if (m_config.hideDelayMs <= 0) m_config.hideDelayMs = kHideDelayMs;
+	if (m_config.windowWidth <= 0) m_config.windowWidth = kWindowWidth;
+	if (m_config.windowHeight <= 0) m_config.windowHeight = kWindowHeight;
+	if (m_config.verticalPosNum <= 0) m_config.verticalPosNum = kVerticalPosNum;
+	if (m_config.verticalPosDen <= 0) m_config.verticalPosDen = kVerticalPosDen;
+
 	Hide();
 
 	SetBackgroundColour(wxColour(244, 244, 244));
 	SetBackgroundStyle(wxBG_STYLE_PAINT);
-	SetClientSize(FromDIP(wxSize(kWindowWidth, kWindowHeight)));
+	SetClientSize(FromDIP(wxSize(m_config.windowWidth, m_config.windowHeight)));
 	Bind(wxEVT_PAINT, &MyFrame::PaintCard, this);
 	PlaceOnScreen();
 
 	// 快照启动时刻的真实锁定状态，避免把历史状态误当成"刚刚发生的变化"
-	m_state = LockState((::GetKeyState(VK_CAPITAL) & 1) != 0, (::GetKeyState(VK_NUMLOCK) & 1) != 0);
+	m_state = LockState((::GetKeyState(VK_CAPITAL) & 1) != 0,
+						(::GetKeyState(VK_NUMLOCK) & 1) != 0,
+						(::GetKeyState(VK_SCROLL) & 1) != 0);
 
 	// 局限：钩子收不到发送给更高权限（管理员）窗口的按键，日常使用不受影响。
 	s_instance = this;
@@ -224,7 +235,7 @@ LRESULT CALLBACK MyFrame::LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM 
 	if (nCode == HC_ACTION && wParam == WM_KEYUP)
 	{
 		const auto &info = *reinterpret_cast<KBDLLHOOKSTRUCT *>(lParam);
-		if (info.vkCode == VK_CAPITAL || info.vkCode == VK_NUMLOCK)
+		if (info.vkCode == VK_CAPITAL || info.vkCode == VK_NUMLOCK || info.vkCode == VK_SCROLL)
 		{
 			// 钩子回调运行在安装线程（主线程）的 GetMessage 内，可直接操作 UI；
 			// 只在 WM_KEYUP 处理，保证切换状态已生效，并天然过滤按键自动重复
@@ -251,7 +262,7 @@ void MyFrame::OnLockKeyToggled(DWORD vkCode)
 		m_displayOn = result.displayOn;
 		Refresh(false);
 		ShowNoActivate();
-		m_nap.Start(kHideDelayMs, wxTIMER_ONE_SHOT);
+		m_nap.Start(m_config.hideDelayMs, wxTIMER_ONE_SHOT);
 	}
 }
 
@@ -260,7 +271,7 @@ void MyFrame::ShowCurrentState()
 	m_overview = true;
 	Refresh(false);
 	ShowNoActivate();
-	m_nap.Start(kHideDelayMs, wxTIMER_ONE_SHOT);
+	m_nap.Start(m_config.hideDelayMs, wxTIMER_ONE_SHOT);
 }
 
 void MyFrame::QuitApp()
@@ -293,14 +304,16 @@ void MyFrame::PaintCard(wxPaintEvent &)
 		gc->SetFont(wxFont(wxFontInfo(wxSize(0, 12)).FaceName("Segoe UI")), wxColour(35, 35, 35));
 		const wxString capsText = m_state.IsCapsLockOn() ? wxString("On") : wxString("Off");
 		const wxString numText = m_state.IsNumLockOn() ? wxString("On") : wxString("Off");
+		const wxString scrollText = m_state.IsScrollLockOn() ? wxString("On") : wxString("Off");
 		auto drawLine = [&](int y, const wxString &text)
 		{
 			double width, height;
 			gc->GetTextExtent(text, &width, &height);
 			gc->DrawText(text, (kWindowWidth - width) / 2, y - height / 2);
 		};
-		drawLine(46, wxString::Format("Caps Lock: %s", capsText));
-		drawLine(66, wxString::Format("Num Lock: %s", numText));
+		drawLine(36, wxString::Format("Caps Lock: %s", capsText));
+		drawLine(56, wxString::Format("Num Lock: %s", numText));
+		drawLine(76, wxString::Format("Scroll Lock: %s", scrollText));
 		return;
 	}
 
@@ -328,6 +341,8 @@ void MyFrame::PaintCard(wxPaintEvent &)
 	}
 	else
 	{
+		// Num Lock 与 Scroll Lock 共用锁体（开=闭合锁梁，关=打开锁梁），
+		// 锁体内部符号区分键位：数字 1 表示 Num Lock，上下双箭头表示 Scroll Lock。
 		gc->SetPen(wxPen(ink, 2.3));
 		auto shackle = gc->CreatePath();
 		shackle.MoveToPoint(69, 33);
@@ -343,12 +358,27 @@ void MyFrame::PaintCard(wxPaintEvent &)
 		}
 		gc->StrokePath(shackle);
 		gc->DrawRectangle(66, 33, 28, 23);
+
 		gc->SetPen(wxPen(ink, 1.8));
-		auto numeral = gc->CreatePath();
-		numeral.MoveToPoint(77, 42);
-		numeral.AddLineToPoint(80, 39);
-		numeral.AddLineToPoint(80, 50);
-		gc->StrokePath(numeral);
+		auto mark = gc->CreatePath();
+		if (m_displayKey == VK_NUMLOCK)
+		{
+			mark.MoveToPoint(77, 42);
+			mark.AddLineToPoint(80, 39);
+			mark.AddLineToPoint(80, 50);
+		}
+		else
+		{
+			mark.MoveToPoint(80, 39);
+			mark.AddLineToPoint(80, 50);
+			mark.MoveToPoint(77, 42);
+			mark.AddLineToPoint(80, 39);
+			mark.AddLineToPoint(83, 42);
+			mark.MoveToPoint(77, 47);
+			mark.AddLineToPoint(80, 50);
+			mark.AddLineToPoint(83, 47);
+		}
+		gc->StrokePath(mark);
 	}
 	if (m_displayKey == VK_CAPITAL && !m_displayOn)
 	{
@@ -379,7 +409,9 @@ void MyFrame::ShowNoActivate()
 void MyFrame::PlaceOnScreen()
 {
 	const wxSize screenSize = wxGetDisplaySize();
-	const int bottomY = (screenSize.GetHeight() * kVerticalPosNum + kVerticalPosDen / 2) / kVerticalPosDen;
+	const int posNum = m_config.verticalPosNum;
+	const int posDen = m_config.verticalPosDen;
+	const int bottomY = (screenSize.GetHeight() * posNum + posDen / 2) / posDen;
 	CenterOnScreen(wxHORIZONTAL);
 	Move(wxPoint(GetPosition().x, bottomY - GetSize().GetHeight() / 2));
 }
